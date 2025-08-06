@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: toleration-admission-webhook-cert
+  namespace: kube-system
+spec:
+  secretName: toleration-admission-webhook-tls
+  commonName: toleration-admission-controller.kube-system.svc
+  dnsNames:
+    - toleration-admission-controller.kube-system.svc
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer

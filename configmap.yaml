@@ -1,0 +1,208 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: toleration-admission-controller-source
+  namespace: kube-system
+data:
+  admission_controller.go: |
+    package main
+
+    import (
+    	"encoding/base64"
+      "encoding/json"
+      "fmt"
+      "io"
+      "log"
+      "net/http"
+
+      "github.com/gorilla/mux"
+
+      "k8s.io/kubernetes/pkg/apis/apps"
+      "k8s.io/kubernetes/pkg/apis/core"
+    )
+
+    type AdmissionReviewRequest struct {
+      Request AdmissionRequest `json:"request"`
+    }
+
+    type AdmissionReviewResponse struct {
+      Response AdmissionResponse `json:"response"`
+      APIVersion string          `json:"apiVersion"`
+      Kind       string          `json:"kind"`
+    }
+
+    type AdmissionRequest struct {
+      Object    map[string]interface{}
+      Kind      RequestKind `json:"kind"`
+      Name      string      `json:"name"`
+      Namespace string      `json:"namespace"`
+      UID       string      `json:"uid"`
+    }
+
+    type AdmissionResponse struct {
+      Allowed bool   `json:"allowed"`
+      Patch   string `json:"patch,omitempty"`
+      PatchType string `json:"patchType,omitempty"`
+      UID       string `json:"uid"`
+    }
+
+    type RequestKind struct {
+      Kind string `json:"kind"`
+    }
+
+    type Toleration struct {
+      Key               string `json:"key"`
+      Value             string `json:"value,omitempty"`
+      Operator          string `json:"operator,omitempty"`
+      Effect            string `json:"effect,omitempty"`
+      TolerationSeconds *int64 `json:"tolerationSeconds,omitempty"`
+    }
+
+    var requiredTolerations = []Toleration{
+      {
+        Key:               "node.kubernetes.io/unreachable",
+        Operator:          "Exists",
+        Effect:            "NoExecute",
+        TolerationSeconds: ptr(int64(10)),
+      },
+      {
+        Key:               "node.kubernetes.io/not-ready",
+        Operator:          "Exists",
+        Effect:            "NoExecute",
+        TolerationSeconds: ptr(int64(10)),
+      },
+    }
+
+    func ptr[T any](v T) *T { return &v }
+
+    func admissionHandler(w http.ResponseWriter, r *http.Request) {
+
+      var admissionReviewRequest AdmissionReviewRequest
+      var admissionReviewResponse AdmissionReviewResponse
+
+      var patch []byte
+      var patchOp []map[string]interface{}
+
+      body, err := io.ReadAll(r.Body)
+      if err != nil {
+        http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+        return
+      }
+
+      // Unmarshal the AdmissionReview partial request into the struct
+      err = json.Unmarshal(body, &admissionReviewRequest)
+      if err != nil {
+        http.Error(w, fmt.Sprintf("Failed to unmarshal AdmissionReview: %v", err), http.StatusBadRequest)
+        return
+      }
+
+      log.Printf("processing %s %s in namespace %s", admissionReviewRequest.Request.Kind.Kind, admissionReviewRequest.Request.Name, admissionReviewRequest.Request.Namespace)
+
+      // Extract the Object from the AdmissionRequest
+      var object []byte
+      object, _ = json.Marshal(admissionReviewRequest.Request.Object)
+
+      // Check the Kind to unmarshal into the correct type (e.g., Pod, Deployment)
+      switch admissionReviewRequest.Request.Kind.Kind {
+      case "Pod":
+        var pod core.Pod
+        err := json.Unmarshal(object, &pod)
+        if err != nil {
+          http.Error(w, fmt.Sprintf("Failed to unmarshal Pod: %v", err), http.StatusInternalServerError)
+          return
+        }
+        // Process the Pod object
+
+      case "Deployment":
+        var deployment apps.Deployment
+        err := json.Unmarshal(object, &deployment)
+        if err != nil {
+          http.Error(w, fmt.Sprintf("Failed to unmarshal Deployment: %v", err), http.StatusInternalServerError)
+          return
+        }
+        // Process the Deployment object
+        var newTolerations []Toleration
+        for _, requiredToleration := range requiredTolerations {
+          tolerationFound := false
+          for _, toleration := range deployment.Spec.Template.Spec.Tolerations {
+            if toleration.Key == requiredToleration.Key {
+              if requiredToleration.Value == "" || toleration.Value == requiredToleration.Value {
+                log.Printf("found toleration: %s:%s op=%s for %ds", toleration.Key, string(toleration.Effect), string(toleration.Operator), *toleration.TolerationSeconds)
+                tolerationFound = true
+                break
+              }
+            }
+          }
+          if !tolerationFound {
+            log.Printf("adding toleration: %s:%s op=%s for %ds", requiredToleration.Key, string(requiredToleration.Effect), string(requiredToleration.Operator), *requiredToleration.TolerationSeconds)
+            newTolerations = append(newTolerations, requiredToleration)
+          }
+        }
+        // If new tolerations need to be added, create the patch
+        if len(newTolerations) > 0 {
+          // if the deployment has no tolerations, add the new ones directly
+          if len(deployment.Spec.Template.Spec.Tolerations) == 0 {
+            patchOp = append(patchOp, map[string]interface{}{
+              "op":    "add",
+              "path":  "/spec/template/spec/tolerations",
+              "value": newTolerations,
+            })
+          // if the deployment has tolerations, append the new ones one by one
+          } else {
+            for _, t := range newTolerations {
+              patchOp = append(patchOp, map[string]interface{}{
+                "op":    "add",
+                "path":  "/spec/template/spec/tolerations/-",
+                "value": t,
+              })
+            }
+          }
+
+          patch, _ = json.Marshal(patchOp)
+          admissionReviewResponse.Response.Patch = base64.StdEncoding.EncodeToString(patch)
+          admissionReviewResponse.Response.PatchType = "JSONPatch"
+        }
+
+      default:
+        http.Error(w, fmt.Sprintf("Unsupported kind: %s", admissionReviewRequest.Request.Kind.Kind), http.StatusBadRequest)
+        return
+      }
+
+      admissionReviewResponse.APIVersion = "admission.k8s.io/v1"
+      admissionReviewResponse.Kind = "AdmissionReview"
+      admissionReviewResponse.Response.Allowed = true
+      admissionReviewResponse.Response.UID = admissionReviewRequest.Request.UID
+      w.Header().Set("Content-Type", "application/json")
+      w.WriteHeader(http.StatusOK)
+      response, _ := json.Marshal(admissionReviewResponse)
+      // log.Printf("Response: %s", response)
+      w.Write(response)
+    }
+
+    func healthHandler(w http.ResponseWriter, r *http.Request) {
+      w.WriteHeader(http.StatusOK)
+      w.Write([]byte("OK"))
+    }
+
+    func main() {
+      certPath := "/mnt/certs/tls.crt"
+      keyPath := "/mnt/certs/tls.key"
+
+      log.Println("Starting Admission Webhook Server...")
+
+      r := mux.NewRouter()
+      r.HandleFunc("/admission", admissionHandler)
+      r.HandleFunc("/health", healthHandler)
+
+      go func() {
+        log.Fatal(http.ListenAndServe(":8080", r))
+      }()
+
+      go func() {
+        if err := http.ListenAndServeTLS(":8443", certPath, keyPath, r); err != nil {
+          log.Printf("HTTPS server error: %v", err)
+        }
+      }()
+
+      select {} // Block forever
+    }

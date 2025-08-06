@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toleration-admission-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: toleration-admission-controller
+  template:
+    metadata:
+      labels:
+        app: toleration-admission-controller
+    spec:
+      containers:
+        - name: toleration-admission-controller
+          image: golang
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              mkdir /app && cd /app && \
+              cp /mnt/src/admission_controller.go . && \
+              go mod init admission-controller && \
+              go get k8s.io/apimachinery && \
+              go mod tidy && \
+              go run admission_controller.go
+          volumeMounts:
+            - mountPath: /mnt/src
+              name: source
+            - mountPath: /mnt/certs
+              name: certs
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8443
+              name: https
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: source
+          configMap:
+            name: toleration-admission-controller-source
+        - name: certs
+          secret:
+            secretName: toleration-admission-webhook-tls
+            optional: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ac-cert-updater-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ac-cert-updater-controller
+  template:
+    metadata:
+      labels:
+        app: ac-cert-updater-controller
+    spec:
+      serviceAccountName: ac-cert-updater-sa
+      containers:
+        - name: alpine
+          image: alpine:latest
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              apk add kubectl || exit 1
+
+              API_SERVER=https://kubernetes.default.svc
+              TOKEN_PATH=/var/run/secrets/kubernetes.io/serviceaccount/token
+              CA_CERT_PATH=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+              kubectl config set-cluster kubernetes \
+                --certificate-authority=$CA_CERT_PATH \
+                --server=$API_SERVER \
+                --embed-certs=true
+
+              kubectl config set-credentials default \
+                --token=$(cat $TOKEN_PATH)
+
+              kubectl config set-context default \
+                --cluster=kubernetes \
+                --user=default
+
+              kubectl config use-context default
+
+              while true; do
+                if kubectl get events -n kube-system  --field-selector involvedObject.kind=Certificate | grep toleration-admission-webhook | grep "successfully issued"; then
+
+                  kubectl rollout restart deployment toleration-admission-controller
+                  kubectl rollout status deployment toleration-admission-controller
+
+                  NEW_CERT=$(kubectl get secret toleration-admission-webhook-tls -n kube-system -o jsonpath='{.data.ca\.crt}')
+                  kubectl patch mutatingwebhookconfiguration toleration-admission-webhook --type='json' -p='[{"op": "replace", "path": "/webhooks/0/clientConfig/caBundle", "value": "'"$NEW_CERT"'"},{"op": "replace", "path": "/webhooks/0/failurePolicy", "value": "Fail"}]'
+                fi
+                sleep 10m
+              done
