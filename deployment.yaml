@@ -113,5 +113,5 @@ spec:
                   NEW_CERT=$(kubectl get secret toleration-admission-webhook-tls -n kube-system -o jsonpath='{.data.ca\.crt}')
                   kubectl patch mutatingwebhookconfiguration toleration-admission-webhook --type='json' -p='[{"op": "replace", "path": "/webhooks/0/clientConfig/caBundle", "value": "'"$NEW_CERT"'"},{"op": "replace", "path": "/webhooks/0/failurePolicy", "value": "Fail"}]'
                 fi
-                sleep 10m
+                sleep 3m
               done
